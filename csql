@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_DIR="${HOME}/.config/cloud-sql-proxy"
+STATE_DIR="${HOME}/.local/share/csql"
+
+usage() {
+  echo "Usage: csql <start|stop|status> [--env ENV]"
+  echo ""
+  echo "Commands:"
+  echo "  start [--env ENV]   Start proxy instances (all envs or specific)"
+  echo "  stop  [--env ENV]   Stop proxy instances (all envs or specific)"
+  echo "  status              Show status of all proxy instances"
+  echo ""
+  echo "Examples:"
+  echo "  csql start            # start all environments"
+  echo "  csql start --env dev  # start only dev"
+  echo "  csql stop --env prod  # stop only prod"
+  echo "  csql status"
+}
+
+parse_env_flag() {
+  local args=("$@")
+  for i in "${!args[@]}"; do
+    if [[ "${args[$i]}" == "--env" ]]; then
+      echo "${args[$((i+1))]:-}"
+      return
+    fi
+  done
+  echo ""
+}
+
+get_config_files() {
+  local env="$1"
+  if [[ -n "$env" ]]; then
+    local f="${CONFIG_DIR}/${env}.yaml"
+    if [[ ! -f "$f" ]]; then
+      echo "Error: config not found: $f" >&2
+      exit 1
+    fi
+    echo "$f"
+  else
+    find "$CONFIG_DIR" -name "*.yaml" | sort
+  fi
+}
+
+env_from_file() {
+  basename "$1" .yaml
+}
+
+cmd_start() {
+  local env
+  env=$(parse_env_flag "$@")
+  local configs
+  configs=$(get_config_files "$env")
+
+  while IFS= read -r config_file; do
+    local env_name
+    env_name=$(env_from_file "$config_file")
+    local count
+    count=$(yq '.instances | length' "$config_file")
+
+    for i in $(seq 0 $((count - 1))); do
+      local name port pid_file log_file
+      name=$(yq ".instances[$i].name" "$config_file")
+      port=$(yq ".instances[$i].port" "$config_file")
+      pid_file="${STATE_DIR}/${env_name}-${port}.pid"
+      log_file="${STATE_DIR}/${env_name}-${port}.log"
+
+      if [[ -f "$pid_file" ]]; then
+        local existing_pid
+        existing_pid=$(cat "$pid_file")
+        if kill -0 "$existing_pid" 2>/dev/null; then
+          echo "  [skip] ${env_name}/${name}:${port} already running (PID ${existing_pid})"
+          continue
+        fi
+      fi
+
+      cloud-sql-proxy \
+        --address 127.0.0.1 \
+        --port "$port" \
+        "$name" \
+        > "$log_file" 2>&1 &
+
+      local pid=$!
+      echo "$pid" > "$pid_file"
+      echo "  [start] ${env_name}/${name}:${port} (PID ${pid})"
+    done
+  done <<< "$configs"
+}
+
+cmd_stop() {
+  local env
+  env=$(parse_env_flag "$@")
+  local configs
+  configs=$(get_config_files "$env")
+
+  while IFS= read -r config_file; do
+    local env_name
+    env_name=$(env_from_file "$config_file")
+    local count
+    count=$(yq '.instances | length' "$config_file")
+
+    for i in $(seq 0 $((count - 1))); do
+      local name port pid_file
+      name=$(yq ".instances[$i].name" "$config_file")
+      port=$(yq ".instances[$i].port" "$config_file")
+      pid_file="${STATE_DIR}/${env_name}-${port}.pid"
+
+      if [[ ! -f "$pid_file" ]]; then
+        echo "  [skip] ${env_name}/${name}:${port} not running"
+        continue
+      fi
+
+      local pid
+      pid=$(cat "$pid_file")
+
+      if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid"
+        local waited=0
+        while kill -0 "$pid" 2>/dev/null && [[ $waited -lt 5 ]]; do
+          sleep 1
+          ((waited++))
+        done
+        echo "  [stop] ${env_name}/${name}:${port} (PID ${pid})"
+      else
+        echo "  [skip] ${env_name}/${name}:${port} was not running (stale PID)"
+      fi
+
+      rm -f "$pid_file"
+    done
+  done <<< "$configs"
+}
+
+cmd_status() {
+  local configs
+  configs=$(get_config_files "")
+
+  printf "%-10s %-45s %-6s %-8s %s\n" "ENV" "INSTANCE" "PORT" "PID" "STATUS"
+  printf "%-10s %-45s %-6s %-8s %s\n" "----------" "---------------------------------------------" "------" "--------" "-------"
+
+  while IFS= read -r config_file; do
+    local env_name
+    env_name=$(env_from_file "$config_file")
+    local count
+    count=$(yq '.instances | length' "$config_file")
+
+    for i in $(seq 0 $((count - 1))); do
+      local name port pid_file pid status
+      name=$(yq ".instances[$i].name" "$config_file")
+      port=$(yq ".instances[$i].port" "$config_file")
+      pid_file="${STATE_DIR}/${env_name}-${port}.pid"
+
+      if [[ -f "$pid_file" ]]; then
+        pid=$(cat "$pid_file")
+        if kill -0 "$pid" 2>/dev/null; then
+          status="running"
+        else
+          pid="-"
+          status="stopped (stale)"
+        fi
+      else
+        pid="-"
+        status="stopped"
+      fi
+
+      printf "%-10s %-45s %-6s %-8s %s\n" "$env_name" "$name" "$port" "$pid" "$status"
+    done
+  done <<< "$configs"
+}
+
+mkdir -p "$STATE_DIR"
+
+SUBCOMMAND="${1:-}"
+shift || true
+
+case "$SUBCOMMAND" in
+  start)   cmd_start "$@" ;;
+  stop)    cmd_stop "$@" ;;
+  status)  cmd_status "$@" ;;
+  -h|--help|help|"") usage; exit 0 ;;
+  *) echo "Unknown command: $SUBCOMMAND"; usage; exit 1 ;;
+esac
