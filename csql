@@ -83,9 +83,10 @@ cmd_start() {
     count=$(yq '.instances | length' "$config_file")
 
     for i in $(seq 0 $((count - 1))); do
-      local name port pid_file log_file
+      local name port psc pid_file log_file
       name=$(yq ".instances[$i].name" "$config_file")
       port=$(yq ".instances[$i].port" "$config_file")
+      psc=$(yq ".instances[$i].psc // false" "$config_file")
       pid_file="${STATE_DIR}/${env_name}-${port}.pid"
       log_file="${STATE_DIR}/${env_name}-${port}.log"
 
@@ -98,15 +99,17 @@ cmd_start() {
         fi
       fi
 
-      cloud-sql-proxy \
-        --address 127.0.0.1 \
-        --port "$port" \
-        "$name" \
-        > "$log_file" 2>&1 &
+      local proxy_args=(--address 127.0.0.1 --port "$port")
+      [[ "$psc" == "true" ]] && proxy_args+=(--psc)
+      proxy_args+=("$name")
+
+      cloud-sql-proxy "${proxy_args[@]}" > "$log_file" 2>&1 &
 
       local pid=$!
       echo "$pid" > "$pid_file"
-      echo "  [start] ${env_name}/${name}:${port} (PID ${pid})"
+      local tag=""
+      [[ "$psc" == "true" ]] && tag=" [PSC]"
+      echo "  [start] ${env_name}/${name}:${port}${tag} (PID ${pid})"
     done
   done <<< "$configs"
 }
