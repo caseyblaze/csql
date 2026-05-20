@@ -50,6 +50,8 @@ instances:
 
 The instance `name` field is the **Connection name** found in GCP Console → Cloud SQL → your instance.
 
+To change or add connections, edit the YAML files in `~/.config/cloud-sql-proxy/`.
+
 ### Port convention (suggested)
 
 | Environment | Port range |
