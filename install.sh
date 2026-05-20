@@ -21,6 +21,9 @@ mkdir -p "$INSTALL_DIR"
 curl -fsSL "$SCRIPT_URL" -o "$INSTALL_DIR/csql"
 chmod +x "$INSTALL_DIR/csql"
 
+# Create config directory so first-run commands don't error on missing dir
+mkdir -p "$HOME/.config/cloud-sql-proxy"
+
 # Ensure ~/bin is in PATH
 SHELL_RC="$HOME/.zshrc"
 if ! grep -q 'PATH.*HOME/bin\|PATH.*~/bin' "$SHELL_RC" 2>/dev/null; then
@@ -45,8 +48,7 @@ echo "${BOLD}${YELLOW}│                                                       
 echo "${BOLD}${YELLOW}│  (or open a new terminal window)                         │${RESET}"
 echo "${BOLD}${YELLOW}└──────────────────────────────────────────────────────────┘${RESET}"
 echo ""
-echo "${BOLD}Then set up your config:${RESET}"
-echo "  mkdir -p ~/.config/cloud-sql-proxy"
+echo "${BOLD}Then create a config:${RESET}"
 echo "  \$EDITOR ~/.config/cloud-sql-proxy/dev.yaml"
 echo ""
 echo "${DIM}Config format:${RESET}"

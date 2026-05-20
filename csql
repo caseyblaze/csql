@@ -30,6 +30,18 @@ parse_env_flag() {
   echo ""
 }
 
+no_configs_hint() {
+  echo "No configs found in $CONFIG_DIR" >&2
+  echo "" >&2
+  echo "Create one to get started:" >&2
+  echo "  \$EDITOR $CONFIG_DIR/dev.yaml" >&2
+  echo "" >&2
+  echo "Example config:" >&2
+  echo "  instances:" >&2
+  echo "    - name: project:region:instance" >&2
+  echo "      port: 5432" >&2
+}
+
 get_config_files() {
   local env="$1"
   if [[ -n "$env" ]]; then
@@ -40,7 +52,17 @@ get_config_files() {
     fi
     echo "$f"
   else
-    find "$CONFIG_DIR" -name "*.yaml" | sort
+    if [[ ! -d "$CONFIG_DIR" ]]; then
+      no_configs_hint
+      exit 1
+    fi
+    local files
+    files=$(find "$CONFIG_DIR" -name "*.yaml" | sort)
+    if [[ -z "$files" ]]; then
+      no_configs_hint
+      exit 1
+    fi
+    echo "$files"
   fi
 }
 
