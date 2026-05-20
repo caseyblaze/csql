@@ -28,21 +28,34 @@ if ! grep -q 'PATH.*HOME/bin\|PATH.*~/bin' "$SHELL_RC" 2>/dev/null; then
   echo "Added ~/bin to PATH in $SHELL_RC"
 fi
 
+BOLD=$'\033[1m'
+YELLOW=$'\033[33m'
+GREEN=$'\033[32m'
+DIM=$'\033[2m'
+RESET=$'\033[0m'
+
 echo ""
-echo "✓ csql installed to $INSTALL_DIR/csql"
+echo "${GREEN}✓ csql installed to $INSTALL_DIR/csql${RESET}"
 echo ""
-echo "Next steps:"
-echo "  1. Reload your shell: source $SHELL_RC"
-echo "  2. Create a config:   mkdir -p ~/.config/cloud-sql-proxy"
-echo "  3. Add your instances to ~/.config/cloud-sql-proxy/dev.yaml"
+echo "${BOLD}${YELLOW}┌──────────────────────────────────────────────────────────┐${RESET}"
+echo "${BOLD}${YELLOW}│  REQUIRED: reload your shell before csql will be found   │${RESET}"
+echo "${BOLD}${YELLOW}│                                                          │${RESET}"
+echo "${BOLD}${YELLOW}│    ${RESET}${BOLD}source $SHELL_RC${RESET}$(printf '%*s' $((47 - ${#SHELL_RC})) '')${BOLD}${YELLOW}│${RESET}"
+echo "${BOLD}${YELLOW}│                                                          │${RESET}"
+echo "${BOLD}${YELLOW}│  (or open a new terminal window)                         │${RESET}"
+echo "${BOLD}${YELLOW}└──────────────────────────────────────────────────────────┘${RESET}"
 echo ""
-echo "Config format:"
-echo "  instances:"
-echo "    - name: project:region:instance"
-echo "      port: 5432"
+echo "${BOLD}Then set up your config:${RESET}"
+echo "  mkdir -p ~/.config/cloud-sql-proxy"
+echo "  \$EDITOR ~/.config/cloud-sql-proxy/dev.yaml"
 echo ""
-echo "Usage:"
-echo "  csql start            # start all envs"
-echo "  csql start --env dev  # start only dev"
-echo "  csql stop"
-echo "  csql status"
+echo "${DIM}Config format:${RESET}"
+echo "${DIM}  instances:${RESET}"
+echo "${DIM}    - name: project:region:instance${RESET}"
+echo "${DIM}      port: 5432${RESET}"
+echo ""
+echo "${DIM}Usage:${RESET}"
+echo "${DIM}  csql start            # start all envs${RESET}"
+echo "${DIM}  csql start --env dev  # start only dev${RESET}"
+echo "${DIM}  csql stop${RESET}"
+echo "${DIM}  csql status${RESET}"
