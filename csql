@@ -70,15 +70,28 @@ env_from_file() {
   basename "$1" .yaml
 }
 
-# Generates an official cloud-sql-proxy v2 config file from the user's YAML.
-# Adds the required top-level address field; all instance fields pass through unchanged.
+# Generates a cloud-sql-proxy v2 TOML config from the user's YAML.
+# Instances are expressed as indexed instance-connection-name-N keys with
+# port and optional psc as query-string parameters per the cloud-sql-proxy spec.
 generate_proxy_config() {
   local env_name="$1"
   local config_file="$2"
-  local proxy_config="${STATE_DIR}/${env_name}-proxy.yaml"
-  local generated
-  generated=$(yq -y '{address: "127.0.0.1"} + (del(.address))' "$config_file")
-  printf '%s\n' "$generated" > "$proxy_config"
+  local proxy_config="${STATE_DIR}/${env_name}-proxy.toml"
+  local count i name port psc qs
+  count=$(yq '.instances | length' "$config_file")
+  {
+    echo 'address = "127.0.0.1"'
+    for i in $(seq 0 $((count - 1))); do
+      name=$(yq -r ".instances[$i].name" "$config_file")
+      port=$(yq -r ".instances[$i].port" "$config_file")
+      qs="port=${port}"
+      psc=$(yq -r ".instances[$i].psc // \"\"" "$config_file")
+      if [[ "$psc" == "true" ]]; then
+        qs="${qs}&psc=true"
+      fi
+      echo "instance-connection-name-${i} = \"${name}?${qs}\""
+    done
+  } > "$proxy_config"
   echo "$proxy_config"
 }
 
@@ -149,7 +162,7 @@ cmd_stop() {
     local env_name pid_file proxy_config
     env_name=$(env_from_file "$config_file")
     pid_file="${STATE_DIR}/${env_name}.pid"
-    proxy_config="${STATE_DIR}/${env_name}-proxy.yaml"
+    proxy_config="${STATE_DIR}/${env_name}-proxy.toml"
 
     cleanup_legacy_pids "$env_name"
 
