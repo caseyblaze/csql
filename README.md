@@ -39,6 +39,9 @@ instances:
     port: 5432
   - name: other-project:asia-east1:analytics-db
     port: 5433
+  - name: my-project:asia-east1:psc-instance
+    port: 5434
+    psc: true   # connect via Private Service Connect
 ```
 
 ```yaml
@@ -76,14 +79,16 @@ csql status             # show status of all instances
 ENV        INSTANCE                                      PORT   PID      STATUS
 ---------- --------------------------------------------- ------ -------- -------
 dev        my-project:asia-east1:main-db                 5432   12345    running
-dev        other-project:asia-east1:analytics-db         5433   12346    running
+dev        other-project:asia-east1:analytics-db         5433   12345    running
 staging    my-project:asia-east1:staging-db              5442   -        stopped
 ```
 
+All instances within the same environment share one PID — a single `cloud-sql-proxy` process handles them all.
+
 ## Logs
 
-Proxy logs are written to `~/.local/share/csql/<env>-<port>.log`.
+Proxy logs are written to `~/.local/share/csql/<env>.log`.
 
 ```bash
-tail -f ~/.local/share/csql/dev-5432.log
+tail -f ~/.local/share/csql/dev.log
 ```
