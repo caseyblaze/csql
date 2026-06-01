@@ -70,6 +70,52 @@ env_from_file() {
   basename "$1" .yaml
 }
 
+# Generates a cloud-sql-proxy v2 TOML config from the user's YAML.
+# Instances are expressed as indexed instance-connection-name-N keys with
+# port and optional psc as query-string parameters per the cloud-sql-proxy spec.
+generate_proxy_config() {
+  local env_name="$1"
+  local config_file="$2"
+  local proxy_config="${STATE_DIR}/${env_name}-proxy.toml"
+  local count i name port psc qs
+  count=$(yq '.instances | length' "$config_file")
+  {
+    echo 'address = "127.0.0.1"'
+    for i in $(seq 0 $((count - 1))); do
+      name=$(yq -r ".instances[$i].name" "$config_file")
+      port=$(yq -r ".instances[$i].port" "$config_file")
+      qs="port=${port}"
+      psc=$(yq -r ".instances[$i].psc // \"\"" "$config_file")
+      if [[ "$psc" == "true" ]]; then
+        qs="${qs}&psc=true"
+      fi
+      echo "instance-connection-name-${i} = \"${name}?${qs}\""
+    done
+  } > "$proxy_config"
+  echo "$proxy_config"
+}
+
+# Kills and removes any per-instance PID files from the old architecture.
+# Pattern {env}-[0-9]*.pid matches "dev-5432.pid" but not "dev.pid".
+cleanup_legacy_pids() {
+  local env_name="$1"
+  local legacy_pid_file legacy_pid
+  while IFS= read -r legacy_pid_file; do
+    [[ -z "$legacy_pid_file" ]] && continue
+    legacy_pid=$(cat "$legacy_pid_file" 2>/dev/null) || { rm -f "$legacy_pid_file"; continue; }
+    if kill -0 "$legacy_pid" 2>/dev/null; then
+      echo "  [migrate] ${env_name}: stopping legacy per-instance process (PID ${legacy_pid})" >&2
+      kill "$legacy_pid" || true
+      local waited=0
+      while kill -0 "$legacy_pid" 2>/dev/null && [[ $waited -lt 5 ]]; do
+        sleep 1
+        ((waited++))
+      done
+    fi
+    rm -f "$legacy_pid_file"
+  done < <(find "${STATE_DIR}" -maxdepth 1 -name "${env_name}-[0-9]*.pid" 2>/dev/null)
+}
+
 cmd_start() {
   local env
   env=$(parse_env_flag "$@")
@@ -77,40 +123,32 @@ cmd_start() {
   configs=$(get_config_files "$env")
 
   while IFS= read -r config_file; do
-    local env_name
+    local env_name count pid_file log_file proxy_config
     env_name=$(env_from_file "$config_file")
-    local count
+    pid_file="${STATE_DIR}/${env_name}.pid"
+    log_file="${STATE_DIR}/${env_name}.log"
+
+    cleanup_legacy_pids "$env_name"
+
+    if [[ -f "$pid_file" ]]; then
+      local existing_pid
+      existing_pid=$(cat "$pid_file")
+      if kill -0 "$existing_pid" 2>/dev/null; then
+        count=$(yq '.instances | length' "$config_file")
+        echo "  [skip] ${env_name}: already running (PID ${existing_pid}, ${count} instance(s))"
+        continue
+      fi
+      rm -f "$pid_file"
+    fi
+
+    proxy_config=$(generate_proxy_config "$env_name" "$config_file")
     count=$(yq '.instances | length' "$config_file")
 
-    for i in $(seq 0 $((count - 1))); do
-      local name port psc pid_file log_file
-      name=$(yq ".instances[$i].name" "$config_file")
-      port=$(yq ".instances[$i].port" "$config_file")
-      psc=$(yq ".instances[$i].psc // false" "$config_file")
-      pid_file="${STATE_DIR}/${env_name}-${port}.pid"
-      log_file="${STATE_DIR}/${env_name}-${port}.log"
+    cloud-sql-proxy --config-file "$proxy_config" >> "$log_file" 2>&1 &
 
-      if [[ -f "$pid_file" ]]; then
-        local existing_pid
-        existing_pid=$(cat "$pid_file")
-        if kill -0 "$existing_pid" 2>/dev/null; then
-          echo "  [skip] ${env_name}/${name}:${port} already running (PID ${existing_pid})"
-          continue
-        fi
-      fi
-
-      local proxy_args=(--address 127.0.0.1 --port "$port")
-      [[ "$psc" == "true" ]] && proxy_args+=(--psc)
-      proxy_args+=("$name")
-
-      cloud-sql-proxy "${proxy_args[@]}" > "$log_file" 2>&1 &
-
-      local pid=$!
-      echo "$pid" > "$pid_file"
-      local tag=""
-      [[ "$psc" == "true" ]] && tag=" [PSC]"
-      echo "  [start] ${env_name}/${name}:${port}${tag} (PID ${pid})"
-    done
+    local pid=$!
+    printf '%s\n' "$pid" > "$pid_file"
+    echo "  [start] ${env_name}: ${count} instance(s) (PID ${pid})"
   done <<< "$configs"
 }
 
@@ -121,39 +159,34 @@ cmd_stop() {
   configs=$(get_config_files "$env")
 
   while IFS= read -r config_file; do
-    local env_name
+    local env_name pid_file proxy_config
     env_name=$(env_from_file "$config_file")
-    local count
-    count=$(yq '.instances | length' "$config_file")
+    pid_file="${STATE_DIR}/${env_name}.pid"
+    proxy_config="${STATE_DIR}/${env_name}-proxy.toml"
 
-    for i in $(seq 0 $((count - 1))); do
-      local name port pid_file
-      name=$(yq ".instances[$i].name" "$config_file")
-      port=$(yq ".instances[$i].port" "$config_file")
-      pid_file="${STATE_DIR}/${env_name}-${port}.pid"
+    cleanup_legacy_pids "$env_name"
 
-      if [[ ! -f "$pid_file" ]]; then
-        echo "  [skip] ${env_name}/${name}:${port} not running"
-        continue
-      fi
+    if [[ ! -f "$pid_file" ]]; then
+      echo "  [skip] ${env_name}: not running"
+      continue
+    fi
 
-      local pid
-      pid=$(cat "$pid_file")
+    local pid
+    pid=$(cat "$pid_file")
 
-      if kill -0 "$pid" 2>/dev/null; then
-        kill "$pid"
-        local waited=0
-        while kill -0 "$pid" 2>/dev/null && [[ $waited -lt 5 ]]; do
-          sleep 1
-          ((waited++))
-        done
-        echo "  [stop] ${env_name}/${name}:${port} (PID ${pid})"
-      else
-        echo "  [skip] ${env_name}/${name}:${port} was not running (stale PID)"
-      fi
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid"
+      local waited=0
+      while kill -0 "$pid" 2>/dev/null && [[ $waited -lt 5 ]]; do
+        sleep 1
+        ((waited++))
+      done
+      echo "  [stop] ${env_name} (PID ${pid})"
+    else
+      echo "  [skip] ${env_name}: was not running (stale PID)"
+    fi
 
-      rm -f "$pid_file"
-    done
+    rm -f "$pid_file" "$proxy_config"
   done <<< "$configs"
 }
 
@@ -165,31 +198,30 @@ cmd_status() {
   printf "%-10s %-45s %-6s %-8s %s\n" "----------" "---------------------------------------------" "------" "--------" "-------"
 
   while IFS= read -r config_file; do
-    local env_name
+    local env_name pid_file env_pid status
     env_name=$(env_from_file "$config_file")
+    pid_file="${STATE_DIR}/${env_name}.pid"
+    env_pid="-"
+    status="stopped"
+
+    if [[ -f "$pid_file" ]]; then
+      local raw_pid
+      raw_pid=$(cat "$pid_file")
+      if kill -0 "$raw_pid" 2>/dev/null; then
+        env_pid="$raw_pid"
+        status="running"
+      else
+        status="stopped (stale)"
+      fi
+    fi
+
     local count
     count=$(yq '.instances | length' "$config_file")
-
     for i in $(seq 0 $((count - 1))); do
-      local name port pid_file pid status
-      name=$(yq ".instances[$i].name" "$config_file")
-      port=$(yq ".instances[$i].port" "$config_file")
-      pid_file="${STATE_DIR}/${env_name}-${port}.pid"
-
-      if [[ -f "$pid_file" ]]; then
-        pid=$(cat "$pid_file")
-        if kill -0 "$pid" 2>/dev/null; then
-          status="running"
-        else
-          pid="-"
-          status="stopped (stale)"
-        fi
-      else
-        pid="-"
-        status="stopped"
-      fi
-
-      printf "%-10s %-45s %-6s %-8s %s\n" "$env_name" "$name" "$port" "$pid" "$status"
+      local name port
+      name=$(yq -r ".instances[$i].name" "$config_file")
+      port=$(yq -r ".instances[$i].port" "$config_file")
+      printf "%-10s %-45s %-6s %-8s %s\n" "$env_name" "$name" "$port" "$env_pid" "$status"
     done
   done <<< "$configs"
 }

@@ -1,0 +1,8 @@
+instances:
+  - name: my-project:asia-east1:main-db
+    port: 5432
+  - name: other-project:asia-east1:analytics-db
+    port: 5433
+  # - name: my-project:asia-east1:psc-instance
+  #   port: 5434
+  #   psc: true
