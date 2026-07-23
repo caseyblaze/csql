@@ -39,7 +39,7 @@ fi
 
 # Wire up csql tab-completion
 if ! grep -q 'csql completion zsh' "$SHELL_RC" 2>/dev/null; then
-  echo 'source <(csql completion zsh)' >> "$SHELL_RC"
+  echo 'command -v csql >/dev/null && source <(csql completion zsh)' >> "$SHELL_RC"
   echo "Added csql tab-completion to $SHELL_RC"
 fi
 

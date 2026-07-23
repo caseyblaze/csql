@@ -118,6 +118,7 @@ cleanup_legacy_pids() {
 }
 
 cmd_start() {
+  mkdir -p "$STATE_DIR"
   local env
   env=$(parse_env_flag "$@")
   local configs
@@ -154,6 +155,7 @@ cmd_start() {
 }
 
 cmd_stop() {
+  mkdir -p "$STATE_DIR"
   local env
   env=$(parse_env_flag "$@")
   local configs
@@ -192,6 +194,7 @@ cmd_stop() {
 }
 
 cmd_status() {
+  mkdir -p "$STATE_DIR"
   local configs
   configs=$(get_config_files "")
 
@@ -270,8 +273,6 @@ EOF
       ;;
   esac
 }
-
-mkdir -p "$STATE_DIR"
 
 SUBCOMMAND="${1:-}"
 shift || true
