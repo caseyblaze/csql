@@ -9,6 +9,7 @@ A shell script to manage multiple [Cloud SQL Auth Proxy](https://cloud.google.co
 - `--env` flag to target a specific environment
 - PID and log management via `~/.local/share/csql/`
 - Uses `gcloud auth application-default` — no service account keys needed
+- zsh tab-completion for subcommands and environment names
 
 ## Requirements
 
@@ -62,6 +63,22 @@ To change or add connections, edit the YAML files in `~/.config/cloud-sql-proxy/
 | dev         | 5432–5439  |
 | staging     | 5442–5449  |
 | prod        | 5452–5459  |
+
+## Tab completion
+
+zsh completion is set up automatically by `install.sh`. Reload your shell
+to activate it:
+
+    source ~/.zshrc
+
+Then:
+
+    csql <TAB>              # start / stop / status / help
+    csql start --env <TAB>  # completes your configured environments
+
+If you installed manually, add this to your `~/.zshrc` (after `compinit`):
+
+    source <(csql completion zsh)
 
 ## Usage
 
