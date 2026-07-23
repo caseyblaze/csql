@@ -31,6 +31,18 @@ if ! grep -q 'PATH.*HOME/bin\|PATH.*~/bin' "$SHELL_RC" 2>/dev/null; then
   echo "Added ~/bin to PATH in $SHELL_RC"
 fi
 
+# Ensure zsh completion system is initialised
+if ! grep -q 'compinit' "$SHELL_RC" 2>/dev/null; then
+  echo 'autoload -Uz compinit && compinit' >> "$SHELL_RC"
+  echo "Added compinit to $SHELL_RC"
+fi
+
+# Wire up csql tab-completion
+if ! grep -q 'csql completion zsh' "$SHELL_RC" 2>/dev/null; then
+  echo 'command -v csql >/dev/null && source <(csql completion zsh)' >> "$SHELL_RC"
+  echo "Added csql tab-completion to $SHELL_RC"
+fi
+
 BOLD=$'\033[1m'
 YELLOW=$'\033[33m'
 GREEN=$'\033[32m'
@@ -65,3 +77,7 @@ echo "${DIM}  csql start            # start all envs${RESET}"
 echo "${DIM}  csql start --env dev  # start only dev${RESET}"
 echo "${DIM}  csql stop${RESET}"
 echo "${DIM}  csql status${RESET}"
+echo ""
+echo "${DIM}Tab-completion (zsh) is enabled after you reload your shell:${RESET}"
+echo "${DIM}  csql <TAB>            # start / stop / status / help${RESET}"
+echo "${DIM}  csql start --env <TAB>  # your configured environments${RESET}"
