@@ -24,23 +24,55 @@ chmod +x "$INSTALL_DIR/csql"
 # Create config directory so first-run commands don't error on missing dir
 mkdir -p "$HOME/.config/cloud-sql-proxy"
 
-# Ensure ~/bin is in PATH
 SHELL_RC="$HOME/.zshrc"
+
+# Appending to a file whose last line has no newline glues our first line onto
+# it, which silently corrupts whatever was there and can break the whole rc file.
+if [ -s "$SHELL_RC" ] && [ "$(tail -c1 "$SHELL_RC" | wc -l)" -eq 0 ]; then
+  printf '\n' >> "$SHELL_RC"
+fi
+
+# Ensure ~/bin is in PATH
 if ! grep -q 'PATH.*HOME/bin\|PATH.*~/bin' "$SHELL_RC" 2>/dev/null; then
   echo 'export PATH="$HOME/bin:$PATH"' >> "$SHELL_RC"
   echo "Added ~/bin to PATH in $SHELL_RC"
 fi
 
-# Ensure zsh completion system is initialised
-if ! grep -q 'compinit' "$SHELL_RC" 2>/dev/null; then
-  echo 'autoload -Uz compinit && compinit' >> "$SHELL_RC"
-  echo "Added compinit to $SHELL_RC"
+# Wire up csql tab-completion.
+#
+# Never append an unconditional `compinit` here. compinit resets $_comps, so a
+# second run late in .zshrc silently wipes every completion registered before it
+# — gcloud/bq/gsutil, nvm and bun all register at source time via `complete -F`
+# rather than from fpath, so they vanish. Bootstrap the completion system only
+# when it is not up yet, the same way gcloud's completion.zsh.inc does.
+if ! grep -q 'csql completion zsh' "$SHELL_RC" 2>/dev/null; then
+  cat >> "$SHELL_RC" <<'COMPLETION_BLOCK'
+
+# csql tab-completion
+if command -v csql >/dev/null; then
+  whence compdef >/dev/null 2>&1 || { autoload -Uz compinit && compinit }
+  source <(csql completion zsh)
+fi
+COMPLETION_BLOCK
+  echo "Added csql tab-completion to $SHELL_RC"
 fi
 
-# Wire up csql tab-completion
-if ! grep -q 'csql completion zsh' "$SHELL_RC" 2>/dev/null; then
-  echo 'command -v csql >/dev/null && source <(csql completion zsh)' >> "$SHELL_RC"
-  echo "Added csql tab-completion to $SHELL_RC"
+# Earlier versions of this installer appended a bare compinit directly above their
+# completion line. Match that exact pair so a hand-written compinit elsewhere in
+# the file is never mistaken for it, and report rather than edit — which of the
+# two lines is the redundant one depends on the rest of the file.
+OLD_COMPINIT_LINE='autoload -Uz compinit && compinit'
+OLD_CSQL_LINE='command -v csql >/dev/null && source <(csql completion zsh)'
+if grep -B1 -Fx "$OLD_CSQL_LINE" "$SHELL_RC" 2>/dev/null | grep -Fxq "$OLD_COMPINIT_LINE"; then
+  echo ""
+  echo "WARNING: an earlier csql installer added these two lines to $SHELL_RC:"
+  echo "    $OLD_COMPINIT_LINE"
+  echo "    $OLD_CSQL_LINE"
+  echo "  That compinit re-runs at the end of your rc file and resets zsh's"
+  echo "  completion table, so completions registered earlier stop working"
+  echo "  (gcloud, bq, gsutil, nvm and bun all register that way)."
+  echo "  Delete both lines, keep a single compinit above them all, and re-run"
+  echo "  this installer to get the guarded block instead."
 fi
 
 BOLD=$'\033[1m'

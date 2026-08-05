@@ -76,9 +76,19 @@ Then:
     csql <TAB>              # start / stop / status / help
     csql start --env <TAB>  # completes your configured environments
 
-If you installed manually, add this to your `~/.zshrc` (after `compinit`):
+If you installed manually, add this to your `~/.zshrc`:
 
-    source <(csql completion zsh)
+    # csql tab-completion
+    if command -v csql >/dev/null; then
+      whence compdef >/dev/null 2>&1 || { autoload -Uz compinit && compinit }
+      source <(csql completion zsh)
+    fi
+
+Keep exactly one `compinit` in your `~/.zshrc`, above everything that registers
+a completion. Each `compinit` resets zsh's completion table, so a second one
+lower down wipes what was registered above it — gcloud, `bq`, `gsutil`, nvm and
+bun all register at source time and stop completing. The guard above runs
+`compinit` only if nothing else has already initialised the system.
 
 ## Usage
 
