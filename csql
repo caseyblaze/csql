@@ -3,21 +3,35 @@ set -euo pipefail
 
 CONFIG_DIR="${HOME}/.config/cloud-sql-proxy"
 STATE_DIR="${HOME}/.local/share/csql"
+ADC_FILE="${CLOUDSDK_CONFIG:-${HOME}/.config/gcloud}/application_default_credentials.json"
+ADC_HASH_FILE="${STATE_DIR}/adc.sha256"
+WATCH_LABEL="com.caseyblaze.csql.authwatch"
+WATCH_PLIST="${HOME}/Library/LaunchAgents/${WATCH_LABEL}.plist"
+WATCH_LOG="${STATE_DIR}/watch.log"
+
+# Environments found running with credentials older than the current ADC file.
+STALE_ENVS=""
 
 usage() {
-  echo "Usage: csql <start|stop|status> [--env ENV]"
+  echo "Usage: csql <start|stop|restart|status|login|watch> [--env ENV]"
   echo ""
   echo "Commands:"
-  echo "  start [--env ENV]   Start proxy instances (all envs or specific)"
-  echo "  stop  [--env ENV]   Stop proxy instances (all envs or specific)"
-  echo "  status              Show status of all proxy instances"
-  echo "  completion zsh      Print zsh tab-completion script"
+  echo "  start   [--env ENV]   Start proxy instances (all envs or specific)"
+  echo "  stop    [--env ENV]   Stop proxy instances (all envs or specific)"
+  echo "  restart [--env ENV]   Restart proxy instances"
+  echo "  status                Show status of all proxy instances and auth"
+  echo "  login                 Refresh Google credentials, then restart what was running"
+  echo "  watch <enable|disable|status>"
+  echo "                        Auto-restart proxies when credentials change (macOS)"
+  echo "  completion zsh        Print zsh tab-completion script"
   echo ""
   echo "Examples:"
   echo "  csql start            # start all environments"
   echo "  csql start --env dev  # start only dev"
   echo "  csql stop --env prod  # stop only prod"
   echo "  csql status"
+  echo "  csql login            # re-auth without stopping/starting by hand"
+  echo "  csql watch enable     # never think about it again"
 }
 
 parse_env_flag() {
@@ -198,6 +212,12 @@ cmd_status() {
   local configs
   configs=$(get_config_files "")
 
+  local adc_mtime=""
+  if [[ -f "$ADC_FILE" ]]; then
+    adc_mtime=$(file_mtime "$ADC_FILE")
+  fi
+  STALE_ENVS=""
+
   printf "%-10s %-45s %-6s %-8s %s\n" "ENV" "INSTANCE" "PORT" "PID" "STATUS"
   printf "%-10s %-45s %-6s %-8s %s\n" "----------" "---------------------------------------------" "------" "--------" "-------"
 
@@ -214,6 +234,13 @@ cmd_status() {
       if kill -0 "$raw_pid" 2>/dev/null; then
         env_pid="$raw_pid"
         status="running"
+        # The PID file is rewritten on every start, so its mtime is when this
+        # proxy read its credentials. Older than the ADC file means the proxy
+        # is still holding the previous refresh token and needs a restart.
+        if [[ -n "$adc_mtime" && "$(file_mtime "$pid_file")" -lt "$adc_mtime" ]]; then
+          status="running (old auth)"
+          STALE_ENVS="${STALE_ENVS}${env_name}"$'\n'
+        fi
       else
         status="stopped (stale)"
       fi
@@ -228,6 +255,366 @@ cmd_status() {
       printf "%-10s %-45s %-6s %-8s %s\n" "$env_name" "$name" "$port" "$env_pid" "$status"
     done
   done <<< "$configs"
+
+  print_auth_summary
+}
+
+# --- Auth --------------------------------------------------------------------
+#
+# cloud-sql-proxy reads Application Default Credentials once at startup and then
+# holds the refresh token in memory for the life of the process. It never
+# re-reads the file and offers no reload signal, so a fresh
+# `gcloud auth application-default login` takes effect only after a restart.
+# Everything below exists to make that restart happen by itself.
+
+file_mtime() {
+  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null
+}
+
+fmt_time() {
+  date -r "$1" '+%Y-%m-%d %H:%M' 2>/dev/null || date -d "@$1" '+%Y-%m-%d %H:%M' 2>/dev/null
+}
+
+adc_hash() {
+  [[ -f "$ADC_FILE" ]] || return 1
+  shasum -a 256 "$ADC_FILE" | awk '{print $1}'
+}
+
+# Guards against acting on a half-written file. gcloud replaces the credentials
+# atomically, but the watcher can also wake on the temp file it writes first.
+adc_ready() {
+  local cred_type
+  [[ -f "$ADC_FILE" ]] || return 1
+  cred_type=$(yq -p json -r '.type // ""' "$ADC_FILE" 2>/dev/null) || return 1
+  [[ -n "$cred_type" && "$cred_type" != "null" ]]
+}
+
+# Who the credentials belong to, as far as the file itself says. gcloud usually
+# leaves `account` empty for user ADC, so fall back to the fields it does fill
+# rather than guessing an identity from the gcloud CLI's own active config.
+adc_identity() {
+  local account cred_type quota_project
+  [[ -f "$ADC_FILE" ]] || return 1
+  account=$(yq -p json -r '.account // .client_email // ""' "$ADC_FILE" 2>/dev/null)
+  if [[ -n "$account" && "$account" != "null" ]]; then
+    printf '%s\n' "$account"
+    return 0
+  fi
+  cred_type=$(yq -p json -r '.type // "unknown"' "$ADC_FILE" 2>/dev/null)
+  quota_project=$(yq -p json -r '.quota_project_id // ""' "$ADC_FILE" 2>/dev/null)
+  if [[ -n "$quota_project" && "$quota_project" != "null" ]]; then
+    printf '%s, quota project %s\n' "$cred_type" "$quota_project"
+  else
+    printf '%s\n' "$cred_type"
+  fi
+}
+
+record_adc_hash() {
+  local h
+  h=$(adc_hash) || return 0
+  printf '%s\n' "$h" > "$ADC_HASH_FILE"
+}
+
+# Env names whose proxy is alive right now. Restarting exactly this set keeps
+# environments the user deliberately left down from being started behind them.
+running_envs() {
+  [[ -d "$CONFIG_DIR" ]] || return 0
+  local config_file env_name pid_file pid
+  while IFS= read -r config_file; do
+    [[ -z "$config_file" ]] && continue
+    env_name=$(env_from_file "$config_file")
+    pid_file="${STATE_DIR}/${env_name}.pid"
+    [[ -f "$pid_file" ]] || continue
+    pid=$(cat "$pid_file" 2>/dev/null) || continue
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "$env_name"
+    fi
+  done < <(find "$CONFIG_DIR" -name "*.yaml" | sort)
+}
+
+restart_envs() {
+  local env_name
+  while IFS= read -r env_name; do
+    [[ -z "$env_name" ]] && continue
+    cmd_stop --env "$env_name"
+    cmd_start --env "$env_name"
+  done <<< "$1"
+}
+
+print_auth_summary() {
+  local identity mtime env_name
+  echo ""
+  if [[ ! -f "$ADC_FILE" ]]; then
+    echo "Auth:  no Application Default Credentials found"
+    echo "       run 'csql login' to sign in"
+    return
+  fi
+
+  identity=$(adc_identity)
+  mtime=$(file_mtime "$ADC_FILE")
+  echo "Auth:  credentials updated $(fmt_time "$mtime") (${identity:-unknown})"
+
+  if [[ -n "$STALE_ENVS" ]]; then
+    while IFS= read -r env_name; do
+      [[ -z "$env_name" ]] && continue
+      echo "       ! ${env_name} started before that — run 'csql restart --env ${env_name}'"
+    done <<< "$STALE_ENVS"
+  fi
+
+  if watch_is_enabled; then
+    echo "Watch: enabled (proxies restart automatically when credentials change)"
+  else
+    echo "Watch: disabled (run 'csql watch enable' to restart on new credentials)"
+  fi
+}
+
+cmd_restart() {
+  local env
+  env=$(parse_env_flag "$@")
+  if [[ -n "$env" ]]; then
+    cmd_stop --env "$env"
+    cmd_start --env "$env"
+  else
+    cmd_stop
+    cmd_start
+  fi
+}
+
+cmd_login() {
+  mkdir -p "$STATE_DIR"
+  local envs env_name
+  envs=$(running_envs)
+
+  if ! gcloud auth application-default login; then
+    echo "" >&2
+    echo "Error: gcloud login did not complete; proxies left untouched." >&2
+    exit 1
+  fi
+
+  # Claim the new credentials so the watcher does not restart on top of us.
+  record_adc_hash
+
+  echo ""
+  if [[ -z "$envs" ]]; then
+    echo "No proxies were running; nothing to restart."
+    echo "Run 'csql start' when you need them."
+    return
+  fi
+
+  echo "Restarting proxies that were running:"
+  restart_envs "$envs"
+}
+
+# Entry point for the launchd watcher. Restarts running proxies only when the
+# credentials file actually changed content, so a redundant write or an
+# unrelated wake-up costs nothing.
+cmd_auth_sync() {
+  mkdir -p "$STATE_DIR"
+  local new_hash old_hash envs
+  adc_ready || return 0
+  new_hash=$(adc_hash) || return 0
+  old_hash=$(cat "$ADC_HASH_FILE" 2>/dev/null || true)
+  if [[ "$new_hash" == "$old_hash" ]]; then
+    return 0
+  fi
+  printf '%s\n' "$new_hash" > "$ADC_HASH_FILE"
+
+  if [[ -z "$old_hash" ]]; then
+    watch_log "recorded credential fingerprint; nothing to restart"
+    return 0
+  fi
+
+  envs=$(running_envs)
+  if [[ -z "$envs" ]]; then
+    watch_log "credentials changed; no proxies running"
+    return 0
+  fi
+
+  watch_log "credentials changed; restarting: $(echo "$envs" | tr '\n' ' ')"
+  restart_envs "$envs"
+}
+
+watch_log() {
+  printf '%s csql: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+require_darwin() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    echo "Error: 'csql watch' is built on launchd and only works on macOS." >&2
+    exit 1
+  fi
+}
+
+# The launchd job runs csql by absolute path, so resolve through any symlink
+# the installer or the user may have left in ~/bin.
+self_path() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [[ -L "$src" ]]; do
+    dir=$(cd -P "$(dirname "$src")" && pwd)
+    src=$(readlink "$src")
+    if [[ "$src" != /* ]]; then
+      src="${dir}/${src}"
+    fi
+  done
+  (cd -P "$(dirname "$src")" && printf '%s/%s\n' "$PWD" "$(basename "$src")")
+}
+
+# launchd agents start from a minimal PATH, so pin the directories the tools
+# actually live in rather than hoping the defaults cover Homebrew or the SDK.
+launchd_path() {
+  local out="" bin dir
+  for bin in cloud-sql-proxy yq gcloud; do
+    dir=$(dirname "$(command -v "$bin" 2>/dev/null || true)")
+    if [[ "$dir" == "." ]]; then
+      continue
+    fi
+    case ":${out}:" in
+      *":${dir}:"*) continue ;;
+    esac
+    out="${out:+${out}:}${dir}"
+  done
+  printf '%s\n' "${out:+${out}:}/usr/bin:/bin:/usr/sbin:/sbin"
+}
+
+# macOS blocks launchd agents from executing anything inside the TCC-protected
+# user folders — the job starts and dies with "Operation not permitted", visible
+# only in the watch log. Refuse up front rather than install a watcher that can
+# never run.
+reject_protected_path() {
+  local bin="$1" dir
+  for dir in "${HOME}/Documents" "${HOME}/Desktop" "${HOME}/Downloads" "${HOME}/Library/Mobile Documents"; do
+    case "$bin" in
+      "${dir}"/*)
+        echo "Error: launchd cannot run csql from ${dir}." >&2
+        echo "       macOS protects that folder, so the watcher would fail silently." >&2
+        echo "" >&2
+        echo "       Install csql outside it and enable the watcher from there:" >&2
+        echo "         cp '${bin}' ~/bin/csql" >&2
+        echo "         ~/bin/csql watch enable" >&2
+        exit 1
+        ;;
+    esac
+  done
+}
+
+watch_is_enabled() {
+  command -v launchctl >/dev/null 2>&1 || return 1
+  launchctl print "gui/$(id -u)/${WATCH_LABEL}" >/dev/null 2>&1
+}
+
+watch_enable() {
+  require_darwin
+  mkdir -p "$STATE_DIR" "${HOME}/Library/LaunchAgents"
+
+  local csql_bin path_value uid sdk_config_entry=""
+  csql_bin=$(self_path)
+  reject_protected_path "$csql_bin"
+  path_value=$(launchd_path)
+  uid=$(id -u)
+
+  # A launchd job inherits nothing from the shell, so carry over the one
+  # variable that decides which credentials file both sides look at.
+  if [[ -n "${CLOUDSDK_CONFIG:-}" ]]; then
+    sdk_config_entry=$(printf '    <key>CLOUDSDK_CONFIG</key>\n    <string>%s</string>' "$CLOUDSDK_CONFIG")
+  fi
+
+  cat > "$WATCH_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${WATCH_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${csql_bin}</string>
+    <string>auth-sync</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>${path_value}</string>
+    <key>HOME</key>
+    <string>${HOME}</string>
+${sdk_config_entry}
+  </dict>
+  <key>WatchPaths</key>
+  <array>
+    <string>${ADC_FILE}</string>
+  </array>
+  <!-- Fallback poll. A kqueue watch can be lost when the watched file is
+       replaced by rename, and auth-sync is a no-op when nothing changed. -->
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>RunAtLoad</key>
+  <false/>
+  <!-- Without this, launchd kills the cloud-sql-proxy processes auth-sync just
+       started as soon as auth-sync itself exits. -->
+  <key>AbandonProcessGroup</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>${WATCH_LOG}</string>
+  <key>StandardErrorPath</key>
+  <string>${WATCH_LOG}</string>
+</dict>
+</plist>
+PLIST
+
+  # Seed the fingerprint so enabling does not trigger an immediate restart.
+  record_adc_hash
+
+  launchctl bootout "gui/${uid}/${WATCH_LABEL}" 2>/dev/null || true
+  launchctl bootstrap "gui/${uid}" "$WATCH_PLIST"
+
+  echo "  [watch] enabled"
+  echo "          watching: $ADC_FILE"
+  echo "          log:      $WATCH_LOG"
+  echo ""
+  echo "Running proxies now restart on their own after"
+  echo "'gcloud auth application-default login'."
+}
+
+watch_disable() {
+  require_darwin
+  local uid
+  uid=$(id -u)
+  if [[ ! -f "$WATCH_PLIST" ]] && ! watch_is_enabled; then
+    echo "  [watch] already disabled"
+    return
+  fi
+  launchctl bootout "gui/${uid}/${WATCH_LABEL}" 2>/dev/null || true
+  rm -f "$WATCH_PLIST"
+  echo "  [watch] disabled"
+}
+
+watch_status() {
+  if watch_is_enabled; then
+    echo "  [watch] enabled"
+  else
+    echo "  [watch] disabled"
+  fi
+  echo "          plist:    $WATCH_PLIST"
+  echo "          watching: $ADC_FILE"
+  echo "          log:      $WATCH_LOG"
+  if [[ -s "$WATCH_LOG" ]]; then
+    echo ""
+    echo "Recent activity:"
+    tail -5 "$WATCH_LOG" | sed 's/^/  /'
+  fi
+}
+
+cmd_watch() {
+  case "${1:-status}" in
+    enable)  watch_enable ;;
+    disable) watch_disable ;;
+    status)  watch_status ;;
+    *)
+      echo "Usage: csql watch <enable|disable|status>" >&2
+      exit 1
+      ;;
+  esac
 }
 
 cmd_completion() {
@@ -244,7 +631,10 @@ _csql() {
     cmds=(
       'start:Start proxy instances'
       'stop:Stop proxy instances'
-      'status:Show status of all proxy instances'
+      'restart:Restart proxy instances'
+      'status:Show status of all proxy instances and auth'
+      'login:Refresh Google credentials and restart what was running'
+      'watch:Auto-restart proxies when credentials change'
       'help:Show usage'
     )
     _describe 'command' cmds
@@ -252,13 +642,24 @@ _csql() {
   fi
 
   case ${words[2]} in
-    start|stop)
+    start|stop|restart)
       if [[ ${words[CURRENT-1]} == --env ]]; then
         local -a envs
         envs=(${config_dir}/*.yaml(N:t:r))
         _describe 'environment' envs
       else
         compadd -- --env
+      fi
+      ;;
+    watch)
+      if (( CURRENT == 3 )); then
+        local -a actions
+        actions=(
+          'enable:Install the launchd watcher'
+          'disable:Remove the launchd watcher'
+          'status:Show watcher state and recent activity'
+        )
+        _describe 'action' actions
       fi
       ;;
   esac
@@ -280,7 +681,11 @@ shift || true
 case "$SUBCOMMAND" in
   start)      cmd_start "$@" ;;
   stop)       cmd_stop "$@" ;;
+  restart)    cmd_restart "$@" ;;
   status)     cmd_status "$@" ;;
+  login)      cmd_login "$@" ;;
+  watch)      cmd_watch "$@" ;;
+  auth-sync)  cmd_auth_sync ;;
   completion) cmd_completion "$@" ;;
   -h|--help|help|"") usage; exit 0 ;;
   *) echo "Unknown command: $SUBCOMMAND"; usage; exit 1 ;;
