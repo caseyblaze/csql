@@ -92,8 +92,13 @@ generate_proxy_config() {
   local env_name="$1"
   local config_file="$2"
   local proxy_config="${STATE_DIR}/${env_name}-proxy.toml"
-  local count i name port psc qs
+  local count i name port psc qs tmp_config
   count=$(yq '.instances | length' "$config_file")
+  # Built in a temp file and moved into place, because each instance costs a
+  # yq call: writing to the real path directly leaves it truncated for long
+  # enough that a concurrent start can exec a proxy against a half-written
+  # config and come up serving only the instances that had been flushed.
+  tmp_config=$(mktemp "${proxy_config}.XXXXXX")
   {
     echo 'address = "127.0.0.1"'
     for i in $(seq 0 $((count - 1))); do
@@ -106,7 +111,8 @@ generate_proxy_config() {
       fi
       echo "instance-connection-name-${i} = \"${name}?${qs}\""
     done
-  } > "$proxy_config"
+  } > "$tmp_config"
+  mv -f "$tmp_config" "$proxy_config"
   echo "$proxy_config"
 }
 
@@ -131,15 +137,48 @@ cleanup_legacy_pids() {
   done < <(find "${STATE_DIR}" -maxdepth 1 -name "${env_name}-[0-9]*.pid" 2>/dev/null)
 }
 
+# Prints whatever was appended to $1 after byte offset $2.
+log_since() {
+  local file="$1" offset="$2"
+  [[ -f "$file" ]] || return 0
+  tail -c "+$((offset + 1))" "$file"
+}
+
+log_size() {
+  [[ -f "$1" ]] || { echo 0; return; }
+  wc -c < "$1" | tr -d ' '
+}
+
+# cloud-sql-proxy exits within milliseconds when it cannot bind a port, so $!
+# alone says nothing about whether the proxy is serving. Returns 0 once the
+# proxy announces it is ready, 1 if the process exits first. A proxy still
+# alive after PROXY_START_TIMEOUT counts as started, so a slow API round-trip
+# is never reported as a failure.
+PROXY_START_TIMEOUT=10
+wait_for_proxy() {
+  local pid="$1" log_file="$2" offset="$3"
+  local ticks=0 max=$((PROXY_START_TIMEOUT * 5))
+  while [[ $ticks -lt $max ]]; do
+    if log_since "$log_file" "$offset" | grep -q 'ready for new connections'; then
+      return 0
+    fi
+    kill -0 "$pid" 2>/dev/null || return 1
+    sleep 0.2
+    ticks=$((ticks + 1))
+  done
+  kill -0 "$pid" 2>/dev/null
+}
+
 cmd_start() {
   mkdir -p "$STATE_DIR"
   local env
   env=$(parse_env_flag "$@")
   local configs
   configs=$(get_config_files "$env")
+  local failed=0
 
   while IFS= read -r config_file; do
-    local env_name count pid_file log_file proxy_config
+    local env_name count pid_file log_file proxy_config log_offset
     env_name=$(env_from_file "$config_file")
     pid_file="${STATE_DIR}/${env_name}.pid"
     log_file="${STATE_DIR}/${env_name}.log"
@@ -160,12 +199,26 @@ cmd_start() {
     proxy_config=$(generate_proxy_config "$env_name" "$config_file")
     count=$(yq '.instances | length' "$config_file")
 
+    # Remember where the shared log ends so a failure reports only this
+    # attempt's output rather than the whole history.
+    log_offset=$(log_size "$log_file")
+
     cloud-sql-proxy --config-file "$proxy_config" >> "$log_file" 2>&1 &
 
     local pid=$!
+    if ! wait_for_proxy "$pid" "$log_file" "$log_offset"; then
+      echo "  [fail] ${env_name}: proxy exited during startup" >&2
+      log_since "$log_file" "$log_offset" | sed 's/^/         /' >&2
+      rm -f "$pid_file"
+      failed=1
+      continue
+    fi
+
     printf '%s\n' "$pid" > "$pid_file"
     echo "  [start] ${env_name}: ${count} instance(s) (PID ${pid})"
   done <<< "$configs"
+
+  return $failed
 }
 
 cmd_stop() {
@@ -334,11 +387,14 @@ running_envs() {
 
 restart_envs() {
   local env_name
+  local failed=0
   while IFS= read -r env_name; do
     [[ -z "$env_name" ]] && continue
     cmd_stop --env "$env_name"
-    cmd_start --env "$env_name"
+    # An env that fails to come back up must not strand the ones behind it.
+    cmd_start --env "$env_name" || failed=1
   done <<< "$1"
+  return $failed
 }
 
 print_auth_summary() {
