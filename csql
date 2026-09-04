@@ -12,6 +12,61 @@ WATCH_LOG="${STATE_DIR}/watch.log"
 # Environments found running with credentials older than the current ADC file.
 STALE_ENVS=""
 
+LOCK_FILE="${STATE_DIR}/lock"
+LOCK_HELD=0
+
+# --- Locking -----------------------------------------------------------------
+#
+# The same proxies are driven from three places: the terminal, `csql login`, and
+# the launchd credential watcher. When two of them interleave a stop and a start
+# for one env, the winner's proxy holds the ports and the loser dies on "address
+# already in use" — so every state-changing command takes this lock first.
+# `status` takes nothing and never blocks.
+
+# A symlink is the lock primitive available wherever bash runs: creating one is
+# atomic, and it carries the owner's PID in the same step, so a waiter never
+# finds a lock that exists but has no owner recorded yet.
+acquire_lock() {
+  local timeout="$1" waited=0 owner
+  mkdir -p "$STATE_DIR"
+  while ! ln -s "$$" "$LOCK_FILE" 2>/dev/null; do
+    owner=$(readlink "$LOCK_FILE" 2>/dev/null || true)
+    # An owner that no longer exists was killed before it could clean up.
+    if [[ -n "$owner" ]] && ! kill -0 "$owner" 2>/dev/null; then
+      rm -f "$LOCK_FILE"
+      continue
+    fi
+    [[ $waited -lt $timeout ]] || return 1
+    sleep 1
+    waited=$((waited + 1))
+  done
+  LOCK_HELD=1
+  trap release_lock EXIT
+  return 0
+}
+
+release_lock() {
+  [[ "$LOCK_HELD" == 1 ]] || return 0
+  # Only ever remove a lock this process still owns.
+  if [[ "$(readlink "$LOCK_FILE" 2>/dev/null || true)" == "$$" ]]; then
+    rm -f "$LOCK_FILE"
+  fi
+  LOCK_HELD=0
+}
+
+lock_owner() {
+  readlink "$LOCK_FILE" 2>/dev/null || echo "unknown"
+}
+
+require_lock() {
+  if ! acquire_lock 30; then
+    echo "Error: another csql command (PID $(lock_owner)) is holding the lock." >&2
+    echo "       That is usually 'csql login' or the credential watcher." >&2
+    echo "       Try again in a moment." >&2
+    exit 1
+  fi
+}
+
 usage() {
   echo "Usage: csql <start|stop|restart|status|login|watch> [--env ENV]"
   echo ""
@@ -130,11 +185,47 @@ cleanup_legacy_pids() {
       local waited=0
       while kill -0 "$legacy_pid" 2>/dev/null && [[ $waited -lt 5 ]]; do
         sleep 1
-        ((waited++))
+        waited=$((waited + 1))
       done
     fi
     rm -f "$legacy_pid_file"
   done < <(find "${STATE_DIR}" -maxdepth 1 -name "${env_name}-[0-9]*.pid" 2>/dev/null)
+}
+
+# The PID of the proxy serving this env, whether or not csql still holds a PID
+# file for it. A start that lost a race, or one killed between spawning the
+# proxy and recording it, leaves a proxy owning the ports with nothing pointing
+# at it; without this, stop reports "not running" and every later start dies on
+# "address already in use".
+proxy_pid_for_env() {
+  local env_name="$1" pid
+  pid=$(cat "${STATE_DIR}/${env_name}.pid" 2>/dev/null || true)
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    printf '%s\n' "$pid"
+    return 0
+  fi
+  pgrep -f "cloud-sql-proxy --config-file ${STATE_DIR}/${env_name}-proxy.toml" 2>/dev/null | head -1 || true
+}
+
+# When a process started, in epoch seconds.
+process_start_epoch() {
+  local pid="$1" started
+  started=$(ps -o lstart= -p "$pid" 2>/dev/null) || return 1
+  [[ -n "$started" ]] || return 1
+  date -j -f '%a %b %e %H:%M:%S %Y' "$started" '+%s' 2>/dev/null ||
+    date -d "$started" '+%s' 2>/dev/null
+}
+
+# Records a proxy this run did not spawn. The PID file is dated to when that
+# proxy started, because cmd_status reads its mtime as the moment the proxy read
+# its credentials — stamping it "now" would hide a stale-auth warning.
+adopt_pid() {
+  local pid="$1" pid_file="$2" started stamp
+  printf '%s\n' "$pid" > "$pid_file"
+  started=$(process_start_epoch "$pid") || return 0
+  stamp=$(date -r "$started" '+%Y%m%d%H%M.%S' 2>/dev/null ||
+    date -d "@${started}" '+%Y%m%d%H%M.%S' 2>/dev/null) || return 0
+  touch -t "$stamp" "$pid_file" 2>/dev/null || true
 }
 
 # Prints whatever was appended to $1 after byte offset $2.
@@ -185,16 +276,18 @@ cmd_start() {
 
     cleanup_legacy_pids "$env_name"
 
-    if [[ -f "$pid_file" ]]; then
-      local existing_pid
-      existing_pid=$(cat "$pid_file")
-      if kill -0 "$existing_pid" 2>/dev/null; then
-        count=$(yq '.instances | length' "$config_file")
-        echo "  [skip] ${env_name}: already running (PID ${existing_pid}, ${count} instance(s))"
-        continue
+    local existing_pid
+    existing_pid=$(proxy_pid_for_env "$env_name")
+    if [[ -n "$existing_pid" ]]; then
+      count=$(yq '.instances | length' "$config_file")
+      if [[ ! -f "$pid_file" ]]; then
+        adopt_pid "$existing_pid" "$pid_file"
+        echo "  [adopt] ${env_name}: proxy was running untracked (PID ${existing_pid})"
       fi
-      rm -f "$pid_file"
+      echo "  [skip] ${env_name}: already running (PID ${existing_pid}, ${count} instance(s))"
+      continue
     fi
+    rm -f "$pid_file"
 
     proxy_config=$(generate_proxy_config "$env_name" "$config_file")
     count=$(yq '.instances | length' "$config_file")
@@ -209,7 +302,8 @@ cmd_start() {
     if ! wait_for_proxy "$pid" "$log_file" "$log_offset"; then
       echo "  [fail] ${env_name}: proxy exited during startup" >&2
       log_since "$log_file" "$log_offset" | sed 's/^/         /' >&2
-      rm -f "$pid_file"
+      # Nothing was recorded for this attempt, and any PID file present now
+      # belongs to a proxy someone else started: removing it would orphan them.
       failed=1
       continue
     fi
@@ -236,24 +330,45 @@ cmd_stop() {
 
     cleanup_legacy_pids "$env_name"
 
-    if [[ ! -f "$pid_file" ]]; then
-      echo "  [skip] ${env_name}: not running"
+    local pid
+    pid=$(proxy_pid_for_env "$env_name")
+
+    if [[ -z "$pid" ]]; then
+      if [[ -f "$pid_file" ]]; then
+        echo "  [skip] ${env_name}: was not running (stale PID)"
+      else
+        echo "  [skip] ${env_name}: not running"
+      fi
+      rm -f "$pid_file" "$proxy_config"
       continue
     fi
 
-    local pid
-    pid=$(cat "$pid_file")
+    if [[ ! -f "$pid_file" ]]; then
+      echo "  [adopt] ${env_name}: found an untracked proxy (PID ${pid})"
+    fi
+
+    kill "$pid" 2>/dev/null || true
+    local waited=0
+    while kill -0 "$pid" 2>/dev/null && [[ $waited -lt 5 ]]; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+
+    # A proxy that ignored SIGTERM still owns the ports, and the start half of a
+    # restart would run straight into them.
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -9 "$pid" 2>/dev/null || true
+      waited=0
+      while kill -0 "$pid" 2>/dev/null && [[ $waited -lt 3 ]]; do
+        sleep 1
+        waited=$((waited + 1))
+      done
+    fi
 
     if kill -0 "$pid" 2>/dev/null; then
-      kill "$pid"
-      local waited=0
-      while kill -0 "$pid" 2>/dev/null && [[ $waited -lt 5 ]]; do
-        sleep 1
-        ((waited++))
-      done
-      echo "  [stop] ${env_name} (PID ${pid})"
+      echo "  [warn] ${env_name}: PID ${pid} would not exit; ports may still be held" >&2
     else
-      echo "  [skip] ${env_name}: was not running (stale PID)"
+      echo "  [stop] ${env_name} (PID ${pid})"
     fi
 
     rm -f "$pid_file" "$proxy_config"
@@ -468,6 +583,13 @@ cmd_auth_sync() {
   mkdir -p "$STATE_DIR"
   local new_hash old_hash envs
   adc_ready || return 0
+  # A user command already restarting these proxies will read the same new
+  # credentials, so stand down rather than race it. The fingerprint stays
+  # unrecorded so the fallback poll retries if that command did nothing.
+  if ! acquire_lock 5; then
+    watch_log "another csql command is running (PID $(lock_owner)); skipping"
+    return 0
+  fi
   new_hash=$(adc_hash) || return 0
   old_hash=$(cat "$ADC_HASH_FILE" 2>/dev/null || true)
   if [[ "$new_hash" == "$old_hash" ]]; then
@@ -733,6 +855,10 @@ EOF
 
 SUBCOMMAND="${1:-}"
 shift || true
+
+case "$SUBCOMMAND" in
+  start|stop|restart|login) require_lock ;;
+esac
 
 case "$SUBCOMMAND" in
   start)      cmd_start "$@" ;;
