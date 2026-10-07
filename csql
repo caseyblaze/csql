@@ -8,9 +8,18 @@ ADC_HASH_FILE="${STATE_DIR}/adc.sha256"
 WATCH_LABEL="com.caseyblaze.csql.authwatch"
 WATCH_PLIST="${HOME}/Library/LaunchAgents/${WATCH_LABEL}.plist"
 WATCH_LOG="${STATE_DIR}/watch.log"
+RELOGIN_PID_FILE="${STATE_DIR}/relogin.pid"
+RELOGIN_MARK_FILE="${STATE_DIR}/relogin.adc"
+# "<adc hash> <epoch>": the last time Google accepted these credentials.
+ADC_OK_FILE="${STATE_DIR}/adc.ok"
+# The adc hash Google has refused, so a dead token is not probed every poll.
+ADC_REFUSED_FILE="${STATE_DIR}/adc.refused"
+TOKEN_URL="https://oauth2.googleapis.com/token"
 
 # Environments found running with credentials older than the current ADC file.
 STALE_ENVS=""
+# Environments whose running proxy Google has stopped issuing tokens to.
+EXPIRED_ENVS=""
 
 LOCK_FILE="${STATE_DIR}/lock"
 LOCK_HELD=0
@@ -77,7 +86,8 @@ usage() {
   echo "  status                Show status of all proxy instances and auth"
   echo "  login                 Refresh Google credentials, then restart what was running"
   echo "  watch <enable|disable|status>"
-  echo "                        Auto-restart proxies when credentials change (macOS)"
+  echo "                        Auto-restart proxies when credentials change, and"
+  echo "                        open the sign-in when they expire (macOS)"
   echo "  completion zsh        Print zsh tab-completion script"
   echo ""
   echo "Examples:"
@@ -385,6 +395,9 @@ cmd_status() {
     adc_mtime=$(file_mtime "$ADC_FILE")
   fi
   STALE_ENVS=""
+  EXPIRED_ENVS=""
+  local refused=0
+  adc_refused && refused=1
 
   printf "%-10s %-45s %-6s %-8s %s\n" "ENV" "INSTANCE" "PORT" "PID" "STATUS"
   printf "%-10s %-45s %-6s %-8s %s\n" "----------" "---------------------------------------------" "------" "--------" "-------"
@@ -408,6 +421,9 @@ cmd_status() {
         if [[ -n "$adc_mtime" && "$(file_mtime "$pid_file")" -lt "$adc_mtime" ]]; then
           status="running (old auth)"
           STALE_ENVS="${STALE_ENVS}${env_name}"$'\n'
+        elif [[ $refused == 1 ]] || env_auth_expired "$env_name"; then
+          status="running (auth expired)"
+          EXPIRED_ENVS="${EXPIRED_ENVS}${env_name}"$'\n'
         fi
       else
         status="stopped (stale)"
@@ -477,6 +493,54 @@ adc_identity() {
   fi
 }
 
+# Asks Google for an access token exactly the way cloud-sql-proxy does: a plain
+# refresh, with no reauth proof attached. Returns 0 if accepted, 1 if refused
+# with invalid_grant, 2 if it could not tell (offline, not user credentials).
+# The secrets go to curl on stdin; on its command line any process could read
+# them from ps.
+ADC_PROBE_REASON=""
+adc_probe() {
+  local body response
+  [[ "$(yq -p json -r '.type // ""' "$ADC_FILE" 2>/dev/null)" == "authorized_user" ]] || return 2
+  body=$(yq -p json -r '"grant_type=refresh_token" +
+    "&client_id=" + (.client_id | @uri) +
+    "&client_secret=" + (.client_secret | @uri) +
+    "&refresh_token=" + (.refresh_token | @uri)' "$ADC_FILE" 2>/dev/null) || return 2
+  response=$(printf '%s' "$body" | curl -s --max-time 15 --data-binary @- "$TOKEN_URL" 2>/dev/null) || return 2
+  if printf '%s' "$response" | grep -q '"access_token"'; then
+    return 0
+  fi
+  if printf '%s' "$response" | grep -q '"invalid_grant"'; then
+    ADC_PROBE_REASON=$(printf '%s' "$response" | yq -p json -r '.error_subtype // .error_description // .error' 2>/dev/null || echo invalid_grant)
+    return 1
+  fi
+  return 2
+}
+
+adc_refused() {
+  local h
+  h=$(adc_hash) || return 1
+  [[ "$(cat "$ADC_REFUSED_FILE" 2>/dev/null || true)" == "$h" ]]
+}
+
+fmt_duration() {
+  printf '%dh %02dm' $(($1 / 3600)) $(($1 % 3600 / 60))
+}
+
+# Google does not tell users how long their session lasts, so measure it: the
+# credentials file is written at sign-in, and the probe brackets the moment
+# Google stopped accepting it to within one poll.
+log_session_end() {
+  local hash="$1" reason="$2" signed_in now ok_hash ok_at bracket=""
+  signed_in=$(file_mtime "$ADC_FILE")
+  now=$(date +%s)
+  read -r ok_hash ok_at 2>/dev/null < "$ADC_OK_FILE" || true
+  if [[ "${ok_hash:-}" == "$hash" && -n "${ok_at:-}" ]]; then
+    bracket="last accepted $(fmt_time "$ok_at") ($(fmt_duration $((ok_at - signed_in)))), "
+  fi
+  watch_log "session ended: signed in $(fmt_time "$signed_in"), ${bracket}refused $(fmt_time "$now") ($(fmt_duration $((now - signed_in)))) [${reason}]"
+}
+
 record_adc_hash() {
   local h
   h=$(adc_hash) || return 0
@@ -498,6 +562,101 @@ running_envs() {
       echo "$env_name"
     fi
   done < <(find "$CONFIG_DIR" -name "*.yaml" | sort)
+}
+
+# cloud-sql-proxy does not exit when Google stops honouring its refresh token.
+# It keeps the ports open and fails every connection with invalid_grant — under
+# a Workspace reauth policy, "reauth related error (invalid_rapt)" — so its log
+# is the only place that shows it. Every start writes the Authorizing line
+# first, which makes an invalid_grant after the last one this proxy's problem.
+env_auth_expired() {
+  local log_file="${STATE_DIR}/$1.log"
+  [[ -f "$log_file" ]] || return 1
+  awk '/Authorizing with Application Default Credentials/ { bad = 0 }
+       /invalid_grant/ { bad = 1 }
+       END { exit !bad }' "$log_file"
+}
+
+expired_envs() {
+  local env_name
+  while IFS= read -r env_name; do
+    [[ -z "$env_name" ]] && continue
+    if env_auth_expired "$env_name"; then
+      echo "$env_name"
+    fi
+  done <<< "$(running_envs)"
+  return 0
+}
+
+# The sign-in the watcher opened, if it is still waiting on the browser. The
+# command line is checked too, so a recycled PID is never mistaken for it.
+relogin_pid() {
+  local pid
+  pid=$(cat "$RELOGIN_PID_FILE" 2>/dev/null) || return 1
+  [[ -n "$pid" ]] || return 1
+  ps -o command= -p "$pid" 2>/dev/null | grep -q 'application-default login' || return 1
+  printf '%s\n' "$pid"
+}
+
+cancel_relogin() {
+  local pid
+  if pid=$(relogin_pid); then
+    kill "$pid" 2>/dev/null || true
+  fi
+  rm -f "$RELOGIN_PID_FILE"
+}
+
+notify() {
+  command -v osascript >/dev/null 2>&1 || return 0
+  osascript -e "display notification \"$1\" with title \"csql\"" >/dev/null 2>&1 || true
+}
+
+# Called on every poll that found the credentials unchanged. A refusal from the
+# probe catches the expiry before anyone connects; the proxy logs still count
+# when the probe cannot run.
+check_auth_expiry() {
+  local hash="$1" envs rc=0
+  if ! adc_refused; then
+    adc_probe || rc=$?
+    case $rc in
+      0) printf '%s %s\n' "$hash" "$(date +%s)" > "$ADC_OK_FILE" ;;
+      1)
+        printf '%s\n' "$hash" > "$ADC_REFUSED_FILE"
+        log_session_end "$hash" "$ADC_PROBE_REASON"
+        ;;
+    esac
+  fi
+
+  # Nothing running means nothing to reconnect, so no sign-in is opened yet;
+  # the first poll after 'csql start' opens it.
+  if adc_refused; then
+    envs=$(running_envs)
+  else
+    envs=$(expired_envs)
+  fi
+  [[ -n "$envs" ]] && prompt_relogin "$envs"
+  return 0
+}
+
+# Opens the Google sign-in in the browser and leaves it waiting there. When it
+# completes, gcloud rewrites the credentials file and the watcher's usual
+# restart takes over. Asks once per set of credentials: a sign-in the user
+# closed is not reopened every poll, only after the next successful login.
+prompt_relogin() {
+  local envs="$1" adc
+  adc=$(adc_hash) || return 0
+  relogin_pid >/dev/null && return 0
+  if [[ "$(cat "$RELOGIN_MARK_FILE" 2>/dev/null || true)" == "$adc" ]]; then
+    return 0
+  fi
+  printf '%s\n' "$adc" > "$RELOGIN_MARK_FILE"
+
+  watch_log "Google refused the credentials for: $(echo "$envs" | tr '\n' ' ')— opening sign-in"
+  notify "Google sign-in expired. Finish signing in in your browser to reconnect Cloud SQL."
+  # stdin is closed so gcloud takes its defaults instead of waiting on a prompt
+  # no one can see.
+  gcloud auth application-default login < /dev/null >> "$WATCH_LOG" 2>&1 &
+  printf '%s\n' "$!" > "$RELOGIN_PID_FILE"
 }
 
 restart_envs() {
@@ -532,6 +691,22 @@ print_auth_summary() {
     done <<< "$STALE_ENVS"
   fi
 
+  if [[ -n "$EXPIRED_ENVS" ]] || adc_refused; then
+    if [[ -n "$EXPIRED_ENVS" ]]; then
+      while IFS= read -r env_name; do
+        [[ -z "$env_name" ]] && continue
+        echo "       ! ${env_name}: Google requires you to sign in again"
+      done <<< "$EXPIRED_ENVS"
+    else
+      echo "       ! Google no longer accepts these credentials"
+    fi
+    if relogin_pid >/dev/null; then
+      echo "         a sign-in page is waiting in your browser (or run 'csql login')"
+    else
+      echo "         run 'csql login'"
+    fi
+  fi
+
   if watch_is_enabled; then
     echo "Watch: enabled (proxies restart automatically when credentials change)"
   else
@@ -556,6 +731,10 @@ cmd_login() {
   local envs env_name
   envs=$(running_envs)
 
+  # One sign-in at a time: a page the watcher opened earlier would otherwise
+  # still be waiting in some tab, holding a localhost port.
+  cancel_relogin
+
   if ! gcloud auth application-default login; then
     echo "" >&2
     echo "Error: gcloud login did not complete; proxies left untouched." >&2
@@ -578,7 +757,8 @@ cmd_login() {
 
 # Entry point for the launchd watcher. Restarts running proxies only when the
 # credentials file actually changed content, so a redundant write or an
-# unrelated wake-up costs nothing.
+# unrelated wake-up costs nothing. Otherwise checks whether Google has started
+# refusing the running proxies, and if so opens the sign-in for the user.
 cmd_auth_sync() {
   mkdir -p "$STATE_DIR"
   local new_hash old_hash envs
@@ -593,6 +773,7 @@ cmd_auth_sync() {
   new_hash=$(adc_hash) || return 0
   old_hash=$(cat "$ADC_HASH_FILE" 2>/dev/null || true)
   if [[ "$new_hash" == "$old_hash" ]]; then
+    check_auth_expiry "$new_hash"
     return 0
   fi
   printf '%s\n' "$new_hash" > "$ADC_HASH_FILE"
@@ -776,6 +957,13 @@ watch_status() {
   echo "          plist:    $WATCH_PLIST"
   echo "          watching: $ADC_FILE"
   echo "          log:      $WATCH_LOG"
+  local session
+  session=$(grep 'session ended:' "$WATCH_LOG" 2>/dev/null | tail -1 || true)
+  if [[ -n "$session" ]]; then
+    echo ""
+    echo "Last measured session:"
+    echo "  ${session#*session ended: }"
+  fi
   if [[ -s "$WATCH_LOG" ]]; then
     echo ""
     echo "Recent activity:"

@@ -10,7 +10,8 @@ A shell script to manage multiple [Cloud SQL Auth Proxy](https://cloud.google.co
 - PID and log management via `~/.local/share/csql/`
 - Uses `gcloud auth application-default` — no service account keys needed
 - `csql login` re-authenticates and restarts only what was running
-- Optional launchd watcher restarts proxies by itself when credentials change
+- Optional launchd watcher restarts proxies by itself when credentials change,
+  and opens the Google sign-in when they expire
 - zsh tab-completion for subcommands and environment names
 
 ## Requirements
@@ -125,6 +126,10 @@ All instances within the same environment share one PID — a single `cloud-sql-
 An environment that started before the current credentials were written shows as
 `running (old auth)`, with the restart command to fix it.
 
+An environment whose proxy Google has stopped accepting shows as
+`running (auth expired)`. The process is still up and holding its ports, but
+every connection fails with `invalid_grant` until you sign in again.
+
 ## Credentials and auto-restart
 
 `cloud-sql-proxy` reads your Application Default Credentials once at startup and
@@ -169,8 +174,51 @@ Enable it from the installed copy (`~/bin/csql`), not from a checkout under
 launchd cannot execute anything inside them, so the watcher would fail on every
 wake-up. `csql watch enable` refuses rather than let that happen quietly.
 
-Signing in still needs you: Google opens a browser and asks for consent. What
-goes away is the `csql stop` / `csql start` afterwards.
+### Expired sign-ins
+
+Under a Google Workspace reauthentication policy, the credentials stop working
+after a while. `cloud-sql-proxy` does not exit when that happens: it keeps the
+ports open and fails every connection with
+`invalid_grant "reauth related error (invalid_rapt)"`, which shows up only in
+its log.
+
+With the watcher enabled, csql asks Google for a token every five minutes, the
+same plain refresh the proxy makes, so it notices the expiry before you try to
+connect. If that check can't run (offline, or credentials that aren't a user
+sign-in), it falls back to looking for `invalid_grant` in the proxy logs.
+
+When the credentials are refused and a proxy is running, csql posts a macOS
+notification and opens the Google sign-in in your browser. Finish signing in
+there, and the proxies restart on their own. You don't need a terminal. If
+nothing is running, it waits: the first check after `csql start` opens the
+sign-in.
+
+It asks once for each set of credentials. If you close that page, it is not
+reopened every five minutes. Run `csql login` when you are ready; it also closes
+any sign-in the watcher left waiting. `csql status` shows which environments are
+affected either way.
+
+### How long a sign-in lasts
+
+Google doesn't tell users how long their reauthentication session is; only a
+Workspace admin can see it (Admin console → Security → Access and data control
+→ Google Cloud session control). The watcher measures it instead. The
+credentials file is written at sign-in, and the five-minute check pins down
+when Google stopped accepting it:
+
+```
+$ csql watch status
+...
+Last measured session:
+  signed in 2026-10-02 23:35, last accepted 2026-10-03 11:30 (11h 55m), refused 2026-10-03 11:35 (12h 00m) [invalid_rapt]
+```
+
+Every measurement is kept in `~/.local/share/csql/watch.log`
+(`grep 'session ended' ~/.local/share/csql/watch.log`).
+
+Signing in itself still needs you, because Google's reauthentication asks for
+your password or second factor in the browser. What goes away is noticing the
+failure, finding the right command, and the `csql stop` / `csql start` afterwards.
 
 ## Logs
 
